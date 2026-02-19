@@ -1,5 +1,3 @@
-YEAH ca fonctionne :
-
 import json
 import os
 import calendar
