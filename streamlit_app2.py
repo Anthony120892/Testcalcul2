@@ -8,6 +8,338 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 
 # ============================================================
+# ARCHIVES / SAUVEGARDE / RÉVISION / INDU-DÛ
+# ============================================================
+import re
+from datetime import datetime
+
+SAVE_DIR = "saved_cases"
+
+def _ensure_save_dir():
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+def _now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+def _safe_filename(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
+    return s[:80] if s else "sans_nom"
+
+def _json_default(o):
+    if isinstance(o, (date, datetime)):
+        return o.isoformat()
+    return str(o)
+
+def save_case(case_payload: dict) -> str:
+    """
+    Sauve un calcul complet (answers + résultats + meta) dans un JSON.
+    Retourne le case_id.
+    """
+    _ensure_save_dir()
+    case_id = case_payload.get("meta", {}).get("case_id") or f"case_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    case_payload.setdefault("meta", {})
+    case_payload["meta"]["case_id"] = case_id
+    case_payload["meta"]["saved_at"] = _now_iso()
+
+    demandeur = _safe_filename(case_payload["meta"].get("demandeur_nom", "") or "sans_nom")
+    fname = f"{case_id}__{demandeur}.json"
+    path = os.path.join(SAVE_DIR, fname)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(case_payload, f, ensure_ascii=False, indent=2, default=_json_default)
+    return case_id
+
+def list_cases() -> list:
+    """
+    Retourne une liste de dict {path, meta} triée par date desc.
+    """
+    _ensure_save_dir()
+    items = []
+    for fn in os.listdir(SAVE_DIR):
+        if not fn.endswith(".json"):
+            continue
+        path = os.path.join(SAVE_DIR, fn)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            meta = payload.get("meta", {})
+            items.append({"path": path, "meta": meta, "payload": payload})
+        except Exception:
+            continue
+
+    def key(it):
+        return it.get("meta", {}).get("saved_at") or it.get("meta", {}).get("created_at") or ""
+    items.sort(key=key, reverse=True)
+    return items
+
+def load_case_by_path(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _month_start(d: date) -> date:
+    return date(d.year, d.month, 1)
+
+def _month_end(d: date) -> date:
+    return end_of_month(d)
+
+def _add_month(d: date) -> date:
+    # ajoute 1 mois en gardant le jour 1
+    y = d.year + (d.month // 12)
+    m = (d.month % 12) + 1
+    return date(y, m, 1)
+
+def iter_month_starts(d_from: date, d_to: date):
+    cur = _month_start(d_from)
+    last = _month_start(d_to)
+    while cur <= last:
+        yield cur
+        cur = _add_month(cur)
+
+def compute_month_segments_generic(answers: dict, engine: dict, month_start: date) -> dict:
+    """
+    Calcule le dû pour un mois entier, en gérant les changements INTRA-MOIS
+    basés sur date_quitte_menage dans answers['cohabitants_art34'].
+    -> prorata jours/nb_jours_mois sur chaque segment
+    """
+    ms = month_start
+    me = _month_end(ms)
+    days_in_month = calendar.monthrange(ms.year, ms.month)[1]
+
+    # points de changement = lendemain d’un départ dans le mois
+    change_points = []
+    for c in answers.get("cohabitants_art34", []) or []:
+        dq = safe_parse_date(c.get("date_quitte_menage"))
+        if dq is None:
+            continue
+        if date_in_same_month(dq, ms) and ms <= dq <= me:
+            nxt = next_day(dq)
+            if ms <= nxt <= next_day(me):
+                change_points.append(nxt)
+
+    change_points = sorted(set(change_points))
+    boundaries = [ms] + change_points + [next_day(me)]
+
+    segments = []
+    total_month = 0.0
+
+    for i in range(len(boundaries) - 1):
+        start = boundaries[i]
+        end_excl = boundaries[i + 1]
+        end = end_excl - timedelta(days=1)
+        if end < start:
+            continue
+
+        seg_days = (end - start).days + 1
+        prorata = seg_days / days_in_month
+
+        res_seg = compute_officiel_cpas_annuel(answers, engine, as_of=start)
+        ris_m = float(res_seg.get("ris_theorique_mensuel", 0.0))
+        amount = r2(ris_m * prorata)
+
+        total_month = r2(total_month + amount)
+        segments.append({
+            "du": str(start),
+            "au": str(end),
+            "jours": int(seg_days),
+            "prorata": float(prorata),
+            "ris_mensuel": r2(ris_m),
+            "montant_segment": float(amount),
+            "as_of": str(start),
+        })
+
+    return {
+        "month_start": str(ms),
+        "month_end": str(me),
+        "jours_dans_mois": int(days_in_month),
+        "segments": segments,
+        "total_mois": float(total_month),
+    }
+
+def compute_revision_table(old_answers: dict,
+                           new_answers: dict,
+                           engine: dict,
+                           from_date: date,
+                           to_date: date,
+                           paid_mode: str = "old_due",
+                           paid_fixed: float = 0.0) -> dict:
+    """
+    Construit un tableau mois par mois :
+    - ancien dû (old)
+    - nouveau dû (new)
+    - payé (selon mode)
+    - indu (payé - dû si >0)
+    - dû complémentaire (dû - payé si >0)
+    """
+    rows = []
+    total_old = total_new = total_paid = total_indu = total_due_more = 0.0
+
+    for ms in iter_month_starts(from_date, to_date):
+        old_m = compute_month_segments_generic(old_answers, engine, ms)["total_mois"]
+        new_m = compute_month_segments_generic(new_answers, engine, ms)["total_mois"]
+
+        if paid_mode == "old_due":
+            paid = float(old_m)
+        else:
+            paid = float(paid_fixed)
+
+        indu = max(0.0, paid - new_m)
+        due_more = max(0.0, new_m - paid)
+
+        total_old += old_m
+        total_new += new_m
+        total_paid += paid
+        total_indu += indu
+        total_due_more += due_more
+
+        rows.append({
+            "mois": ms.strftime("%Y-%m"),
+            "ancien_du": r2(old_m),
+            "nouveau_du": r2(new_m),
+            "paye": r2(paid),
+            "indu": r2(indu),
+            "du_complement": r2(due_more),
+        })
+
+    return {
+        "rows": rows,
+        "totaux": {
+            "ancien_du": r2(total_old),
+            "nouveau_du": r2(total_new),
+            "paye": r2(total_paid),
+            "indu": r2(total_indu),
+            "du_complement": r2(total_due_more),
+        }
+    }
+
+def ui_archives_and_revision(engine: dict):
+    st.subheader("📚 Archives & Révisions")
+    st.caption("Sauvegardes persistantes dans le dossier saved_cases/. Clique un calcul, modifie ce qui manque, et calcule l’indu/dû.")
+
+    cases = list_cases()
+    if not cases:
+        st.info("Aucune sauvegarde pour l’instant. Fais un calcul puis sauvegarde-le 🙂")
+        return
+
+    options = []
+    for it in cases:
+        meta = it.get("meta", {})
+        label = (
+            f"{meta.get('saved_at','?')} — "
+            f"{meta.get('demandeur_nom','(sans nom)')} — "
+            f"{meta.get('categorie','?')} — "
+            f"demande: {meta.get('date_demande','?')}"
+        )
+        options.append((label, it["path"]))
+
+    chosen = st.selectbox("Choisir un calcul sauvegardé", options=options, format_func=lambda x: x[0])
+    path = chosen[1]
+    payload = load_case_by_path(path)
+
+    meta = payload.get("meta", {})
+    old_answers = payload.get("answers_snapshot", {}) or {}
+    old_res = payload.get("res_mois_suivants", {}) or {}
+
+    st.markdown("### Détails du calcul sauvegardé")
+    st.write(f"- **Demandeur** : {meta.get('demandeur_nom','')}")
+    st.write(f"- **Catégorie** : {meta.get('categorie','')}")
+    st.write(f"- **Date demande** : {meta.get('date_demande','')}")
+    st.write(f"- **RI (mois suivant, sauvegardé)** : {euro(old_res.get('ris_theorique_mensuel',0))} € / mois")
+
+    st.divider()
+    st.markdown("### Révision (modifie ce qui a été oublié)")
+    st.caption("Interface de base : tu édites le snapshot JSON des réponses, puis on recalcule.")
+
+    old_json = json.dumps(old_answers, ensure_ascii=False, indent=2, default=_json_default)
+    edited = st.text_area("answers_snapshot (JSON éditable)", value=old_json, height=380)
+
+    new_answers = None
+    parse_ok = True
+    try:
+        new_answers = json.loads(edited)
+    except Exception as e:
+        parse_ok = False
+        st.error(f"JSON invalide : {e}")
+
+    st.divider()
+    st.markdown("### Période de révision / Indu - Dû")
+
+    # dates
+    d0 = safe_parse_date(meta.get("date_demande")) or safe_parse_date(old_answers.get("date_demande")) or date.today()
+    from_default = d0
+
+    col1, col2 = st.columns(2)
+    from_date = col1.date_input("Du (début)", value=from_default)
+    to_date = col2.date_input("Au (fin)", value=date.today())
+
+    paid_mode = st.radio("Payé (référence)", ["Utiliser ancien dû comme payé", "Montant payé fixe"], index=0, horizontal=True)
+    paid_fixed = 0.0
+    if paid_mode == "Montant payé fixe":
+        paid_fixed = st.number_input("Montant payé (€/mois)", min_value=0.0, value=0.0, step=10.0)
+
+    st.divider()
+    if st.button("Calculer la révision (table mois par mois)", disabled=(not parse_ok)):
+        # Normalisation minimale (dates)
+        # IMPORTANT: ton moteur attend parfois des 'date' en vrai objet.
+        # Ici on convertit seulement date_demande si présent.
+        if isinstance(new_answers, dict):
+            dd = safe_parse_date(new_answers.get("date_demande"))
+            if dd is not None:
+                new_answers["date_demande"] = dd
+            # idem cohabitants_art34.date_quitte_menage restera string, ton safe_parse_date le gère.
+
+        paid_mode_key = "old_due" if paid_mode.startswith("Utiliser") else "fixed"
+
+        rev = compute_revision_table(
+            old_answers=old_answers,
+            new_answers=new_answers,
+            engine=engine,
+            from_date=from_date,
+            to_date=to_date,
+            paid_mode=paid_mode_key,
+            paid_fixed=float(paid_fixed)
+        )
+
+        st.markdown("#### Résultat révision")
+        st.write("**Totaux période**")
+        t = rev["totaux"]
+        st.write(f"- Ancien dû : {euro(t['ancien_du'])} €")
+        st.write(f"- Nouveau dû : {euro(t['nouveau_du'])} €")
+        st.write(f"- Payé : {euro(t['paye'])} €")
+        st.write(f"- **Indu** : {euro(t['indu'])} €")
+        st.write(f"- **Dû complémentaire** : {euro(t['du_complement'])} €")
+
+        st.divider()
+        st.markdown("#### Détail mois par mois")
+        st.dataframe(rev["rows"], use_container_width=True)
+
+        # Export CSV
+        csv = "mois,ancien_du,nouveau_du,paye,indu,du_complement\n"
+        for r in rev["rows"]:
+            csv += f"{r['mois']},{r['ancien_du']},{r['nouveau_du']},{r['paye']},{r['indu']},{r['du_complement']}\n"
+        st.download_button("Télécharger le CSV", data=csv.encode("utf-8"), file_name="revision_indu_du.csv", mime="text/csv")
+
+    st.divider()
+    st.markdown("### (Option) Sauvegarder la révision")
+    if st.button("Sauvegarder une nouvelle version (snapshot révisé)", disabled=(not parse_ok)):
+        new_payload = dict(payload)
+        new_payload["meta"] = dict(payload.get("meta", {}))
+        new_payload["meta"]["created_at"] = payload.get("meta", {}).get("created_at") or payload.get("meta", {}).get("saved_at") or _now_iso()
+        new_payload["meta"]["revision_of"] = payload.get("meta", {}).get("case_id")
+        new_payload["meta"]["case_id"] = f"{payload.get('meta', {}).get('case_id','case')}_REV_{datetime.now().strftime('%H%M%S')}"
+        new_payload["answers_snapshot"] = new_answers
+
+        # recalcul rapide (mois suivants)
+        dd = safe_parse_date(new_answers.get("date_demande")) or date.today()
+        new_answers["date_demande"] = dd
+        seg_first = compute_first_month_segments(new_answers, engine)
+        res_ms = seg_first.get("detail_mois_suivants", {}) or compute_officiel_cpas_annuel(new_answers, engine)
+
+        new_payload["seg_first_month"] = seg_first
+        new_payload["res_mois_suivants"] = res_ms
+
+        save_case(new_payload)
+        st.success("Révision sauvegardée ✅ (nouvelle entrée dans les archives)")
+# ============================================================
 # CONFIG PAR DÉFAUT (fusion avec ris_rules.json si présent)
 # ============================================================
 DEFAULT_ENGINE = {
@@ -958,6 +1290,10 @@ def make_decision_pdf_cpas(*args, **kwargs) -> Optional[BytesIO]:
 # ============================================================
 # UI STREAMLIT
 # ============================================================
+if page == "Archives & Révisions":
+    ui_archives_and_revision(engine)
+    st.stop()
+    
 st.set_page_config(page_title="Calcul RIS", layout="centered")
 
 if os.path.exists("logo.png"):
@@ -970,6 +1306,8 @@ cfg = engine["config"]
 # Sidebar paramètres
 # ---------------------------
 with st.sidebar:
+    st.sidebar.divider()
+    page = st.sidebar.radio("Navigation", ["Calcul", "Archives & Révisions"], index=0)
     st.subheader("Paramètres (JSON / indexables)")
 
     st.write("**Taux RIS ANNUELS (référence)**")
@@ -1019,6 +1357,7 @@ with st.sidebar:
 # ---------------------------
 # Helpers UI
 # ---------------------------
+  
 def euro(x: float) -> str:
     x = float(x or 0.0)
     s = f"{x:,.2f}"
@@ -1702,6 +2041,23 @@ else:
             cfg_cession=cfg["cession"],
         )
 
+    st.divider()
+    if st.button("💾 Sauvegarder ce calcul"):
+        payload = {
+            "meta": {
+                "created_at": _now_iso(),
+                "demandeur_nom": answers.get("demandeur_nom",""),
+                "categorie": answers.get("categorie",""),
+                "date_demande": str(answers.get("date_demande","")),
+            },
+            "answers_snapshot": answers,
+            "seg_first_month": seg_first,
+            "res_mois_suivants": res_ms,
+            "engine_snapshot": engine,  # utile si un jour tu changes tes paramètres
+        }
+        save_case(payload)
+        st.success("Calcul sauvegardé ✅")
+        
         st.subheader("Résultat")
         st.write(f"**RI mois suivant** : {euro(res_ms.get('ris_theorique_mensuel',0))} € / mois")
         if seg_first and seg_first.get("segments"):
