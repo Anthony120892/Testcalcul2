@@ -1290,9 +1290,9 @@ def make_decision_pdf_cpas(*args, **kwargs) -> Optional[BytesIO]:
 # ============================================================
 # UI STREAMLIT
 # ============================================================
-if page == "Archives & Révisions":
-    ui_archives_and_revision(engine)
-    st.stop()
+    if page == "Archives & Révisions":
+        ui_archives_and_revision(engine)
+        st.stop()
     
 st.set_page_config(page_title="Calcul RIS", layout="centered")
 
